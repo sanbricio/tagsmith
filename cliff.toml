@@ -1,0 +1,96 @@
+# =============================================================================
+# tagsmith — git-cliff configuration (GitHub)
+#
+# Professional changelog: commits grouped by type, plus "Contributors" and
+# "New Contributors" sections resolved via the GitHub API when online
+# (git-cliff --github-repo/--github-token). Falls back gracefully when offline.
+#
+# Links:
+#   __PROJECT_URL__ is replaced by tagsmith with the repo URL at run time, so
+#   header / compare / PR / issue links work in both online and offline modes.
+# =============================================================================
+
+[changelog]
+body = """
+{% if version %}\
+    ## [{{ version | trim_start_matches(pat="v") }}](__PROJECT_URL__/releases/tag/{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
+            {% if commit.breaking %}[**breaking**] {% endif %}\
+            {{ commit.message | split(pat="\n") | first | upper_first }}\
+            {% if not github.contributors %} *({{ commit.author.name }})*{% endif %}\
+    {% endfor %}
+{% endfor %}\
+{% if github %}\
+{% set first_timers = github.contributors | filter(attribute="is_first_time", value=true) %}\
+{% if first_timers | length > 0 %}
+    ### 🌟 New Contributors
+    {% for c in first_timers %}{% if not c.username is ending_with("[bot]") %}
+        - @{{ c.username }} made their first contribution{% if c.pr_number %} in [#{{ c.pr_number }}](__PROJECT_URL__/pull/{{ c.pr_number }}){% endif %}\
+    {%- endif %}{% endfor %}
+{% endif %}\
+{% if github.contributors | length > 0 %}
+    ### ❤️ Contributors
+    {% for c in github.contributors %}{% if not c.username is ending_with("[bot]") %}
+        - @{{ c.username }}\
+    {%- endif %}{% endfor %}
+{% endif %}\
+{% endif %}\
+{% if version and previous.version %}
+**Full Changelog**: __PROJECT_URL__/compare/{{ previous.version }}...{{ version }}
+{% endif %}
+"""
+trim = true
+render_always = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+require_conventional = false
+split_commits = false
+protect_breaking_commits = false
+filter_commits = false
+topo_order = true
+sort_commits = "oldest"
+# Preprocessors run BEFORE commit parsing:
+#   1. Strip the commit body (everything after the first line). The changelog
+#      only renders the subject, and this keeps the strict conventional parser
+#      from dropping otherwise-valid commits with a non-conforming body.
+#   2. Linkify "#123" → GitHub issue/PR link (issues/N redirects to pull/N).
+commit_preprocessors = [
+    { pattern = "(?s)\\r?\\n.*", replace = "" },
+    { pattern = "#(\\d+)", replace = "[#${1}](__PROJECT_URL__/issues/${1})" },
+]
+commit_parsers = [
+    # ── Skip rules (FIRST — git-cliff uses first match) ──
+    { message = "^Merge branch", skip = true },
+    { message = "^Merge remote", skip = true },
+    { message = "^Merge pull request", skip = true },
+    { message = ".*Renovate.*", skip = true },
+    { message = ".*renovate.*", skip = true },
+    { message = ".*dependabot.*", skip = true },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^chore\\(deps.*\\)", skip = true },
+    { message = "^build\\(deps.*\\)", skip = true },
+    { message = "(?i)^chore: bump ", skip = true },
+    { message = "(?i)bump .+ in the .+ group", skip = true },
+    { message = "^chore\\(pr\\)", skip = true },
+    { message = "^chore\\(pull\\)", skip = true },
+    { message = ".*CHANGELOG.*", skip = true },
+    # ── Group rules ──
+    { message = "^feat", group = "<!-- 0 -->🚀 Features" },
+    { message = "^fix", group = "<!-- 1 -->🐛 Bug Fixes" },
+    { message = "^security", group = "<!-- 8 -->🛡️ Security" },
+    { message = "^doc", group = "<!-- 3 -->📚 Documentation" },
+    { message = "^perf", group = "<!-- 4 -->⚡ Performance" },
+    { message = "^refactor", group = "<!-- 2 -->🚜 Refactor" },
+    { message = "^style", group = "<!-- 5 -->🎨 Styling" },
+    { message = "^test", group = "<!-- 6 -->🧪 Testing" },
+    { message = "^chore|^ci", group = "<!-- 7 -->⚙️ Miscellaneous Tasks" },
+    { message = "^revert", group = "<!-- 9 -->◀️ Revert" },
+]

@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# =============================================================================
+# tagsmith — craft polished GitHub releases
+#
+# One command: generate a professional CHANGELOG.md (grouped commits +
+# Contributors / New Contributors via the GitHub API), tag the release, push it,
+# and publish a GitHub Release with the changelog section as notes.
+#
+# Usage:
+#   tagsmith <version>           # Full release (changelog + tag + push + GitHub Release)
+#   tagsmith <version> --dry-run # Preview changelog only, no changes
+#   tagsmith <version> --init    # Generate initial CHANGELOG.md with full history
+#
+# Examples:
+#   tagsmith 0.3.0
+#   tagsmith v0.3.0
+#   tagsmith 0.3.0 --dry-run
+#   tagsmith 1.0.0-rc.1
+#   tagsmith 1.0.0-beta
+#   tagsmith 1.0.0+build.5
+#   tagsmith 1.0.0 --init
+#
+# Requirements:
+#   - git-cliff   → https://git-cliff.org/docs/installation
+#   - gh (GitHub CLI), authenticated → https://cli.github.com  (run: gh auth login)
+#   - Git with an 'origin' remote pointing to GitHub
+# =============================================================================
+set -euo pipefail
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CLIFF_CONFIG="${SCRIPT_DIR}/cliff.toml"
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+log_info()  { echo -e "${BLUE}ℹ${NC}  $*"; }
+log_ok()    { echo -e "${GREEN}✔${NC}  $*"; }
+log_warn()  { echo -e "${YELLOW}⚠${NC}  $*"; }
+log_error() { echo -e "${RED}✖${NC}  $*" >&2; }
+log_step()  { echo -e "\n${CYAN}━━━ $* ━━━${NC}"; }
+die() { log_error "$@"; exit 1; }
+
+# ─── Version ─────────────────────────────────────────────────────────────────
+# Resolved from `git describe` against the script's own repo, so it reflects
+# the actual checked-out state (tag, commits-ahead, dirty). Falls back to
+# "unknown" when the script lives outside a git working tree.
+get_version() {
+    git -C "$SCRIPT_DIR" describe --tags --dirty 2>/dev/null || echo "unknown"
+}
+
+usage() {
+    echo "Usage: tagsmith <version> [--dry-run | --init]"
+    echo ""
+    echo "Commands:"
+    echo "  tagsmith <version>            Full release (changelog + tag + push + GitHub Release)"
+    echo "  tagsmith <version> --dry-run  Preview changelog without modifying anything"
+    echo "  tagsmith <version> --init     Generate initial CHANGELOG.md with full history"
+    echo ""
+    echo "Options:"
+    echo "  <version>    Semver version to release — with or without leading 'v'"
+    echo "               Examples: 1.2.3 | v1.2.3 | 1.2.3-rc.1 | 1.2.3-beta | 1.2.3+build.5"
+    echo "  --version,-v Print the installed tool version and exit"
+    echo "  --help,-h    Show this help"
+    echo ""
+    echo "  The changelog always uses the bare version (e.g. 1.2.3)."
+    echo "  The git tag always uses the 'v' prefix (e.g. v1.2.3)."
+    exit 0
+}
+
+# ─── Semver validation ───────────────────────────────────────────────────────
+# Accepts the bare version (no leading v/V).
+# Supports:
+#   1.2.3
+#   1.2.3-rc.1   1.2.3-beta   1.2.3-alpha.2
+#   1.2.3+build.5
+#   1.2.3-rc.1+build.5
+validate_semver() {
+    local ver="$1"
+    local semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9][a-zA-Z0-9.]*)?(\+[a-zA-Z0-9][a-zA-Z0-9.]*)?$'
+    if [[ ! "$ver" =~ $semver_re ]]; then
+        die "Invalid version: '${ver}'.
+  Expected format : X.Y.Z[-prerelease][+build]
+  Valid examples  : 1.2.3 | 1.2.3-rc.1 | 1.2.3-beta | 1.2.3+build.5"
+    fi
+}
+
+# ─── Resolve editor ──────────────────────────────────────────────────────────
+resolve_editor() {
+    if [[ -n "${EDITOR:-}" ]]; then
+        echo "$EDITOR"
+        return
+    fi
+    if command -v code &>/dev/null; then
+        echo "code --wait"
+        return
+    fi
+    for editor in vim vi nano; do
+        if command -v "$editor" &>/dev/null; then
+            echo "$editor"
+            return
+        fi
+    done
+    return 1
+}
+
+# ─── Detect GitHub owner/repo/URL from the origin remote ─────────────────────
+# Sets: PROJECT_URL, REPO_OWNER, REPO_NAME, REPO_SLUG (owner/repo), IS_GITHUB.
+detect_project_url() {
+    local remote_url host owner repo
+    remote_url="$(git remote get-url origin 2>/dev/null)" || return 1
+
+    if [[ "$remote_url" =~ ^git@ ]]; then
+        # git@github.com:owner/repo.git → https://github.com/owner/repo
+        host="$(echo "$remote_url"  | sed -E 's|^git@([^:]+):.*|\1|')"
+        owner="$(echo "$remote_url" | sed -E 's|^git@[^:]+:([^/]+)/.*|\1|')"
+        repo="$(echo "$remote_url"  | sed -E 's|^git@[^:]+:[^/]+/(.+)$|\1|' | sed 's/\.git$//')"
+    elif [[ "$remote_url" =~ ^https?:// ]]; then
+        # https://github.com/owner/repo(.git) → owner / repo
+        host="$(echo "$remote_url"  | sed -E 's|^https?://([^/]+)/.*|\1|')"
+        owner="$(echo "$remote_url" | sed -E 's|^https?://[^/]+/([^/]+)/.*|\1|')"
+        repo="$(echo "$remote_url"  | sed -E 's|^https?://[^/]+/[^/]+/(.+)$|\1|' | sed 's/\.git$//')"
+    else
+        return 1
+    fi
+
+    REPO_OWNER="$owner"
+    REPO_NAME="$repo"
+    REPO_SLUG="${owner}/${repo}"
+    PROJECT_URL="https://${host}/${owner}/${repo}"
+    if [[ "$host" == "github.com" ]]; then
+        IS_GITHUB=true
+    else
+        IS_GITHUB=false
+    fi
+}
+
+# ─── Resolve a GitHub token (env or gh) for git-cliff's API integration ───────
+resolve_github_token() {
+    GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [[ -z "$GITHUB_TOKEN" ]] && command -v gh &>/dev/null; then
+        GITHUB_TOKEN="$(gh auth token 2>/dev/null || true)"
+    fi
+}
+
+# ─── Build effective cliff config with project-specific links ─────────────────
+# cliff.toml uses the placeholder __PROJECT_URL__ in its template and commit
+# preprocessors (version header link, compare link, issue/PR links). We bake the
+# detected repo URL into a throwaway copy so links resolve correctly — and work
+# in both online and offline modes.
+prepare_cliff_config() {
+    EFFECTIVE_CLIFF_CONFIG="$(mktemp "${TMPDIR:-/tmp}/cliff.XXXXXX.toml")"
+    cp "$CLIFF_CONFIG" "$EFFECTIVE_CLIFF_CONFIG"
+    # '|' is safe as a sed delimiter — it never appears in our URLs.
+    sed -i.bak "s|__PROJECT_URL__|${PROJECT_URL:-}|g" "$EFFECTIVE_CLIFF_CONFIG"
+    rm -f "${EFFECTIVE_CLIFF_CONFIG}.bak"
+}
+
+cleanup_tmp() {
+    [[ "${EFFECTIVE_CLIFF_CONFIG:-}" != "$CLIFF_CONFIG" && -f "${EFFECTIVE_CLIFF_CONFIG:-}" ]] \
+        && rm -f "$EFFECTIVE_CLIFF_CONFIG"
+    [[ -n "${NOTES_FILE:-}" && -f "${NOTES_FILE:-}" ]] && rm -f "$NOTES_FILE"
+    return 0
+}
+trap cleanup_tmp EXIT
+
+# ─── Preflight checks ────────────────────────────────────────────────────────
+preflight() {
+    command -v git-cliff &>/dev/null \
+        || die "git-cliff is not installed. → https://git-cliff.org/docs/installation"
+    command -v gh &>/dev/null \
+        || die "GitHub CLI (gh) is not installed. → https://cli.github.com"
+    git rev-parse --is-inside-work-tree &>/dev/null \
+        || die "Not inside a Git repository."
+}
+
+# ─── Sync with remote main/master ────────────────────────────────────────────
+sync_main() {
+    local branch
+    branch="$(git symbolic-ref --short HEAD 2>/dev/null)" || branch=""
+
+    if [[ "$branch" != "main" && "$branch" != "master" ]]; then
+        log_info "Switching to main..."
+        git checkout main 2>/dev/null \
+            || git checkout master 2>/dev/null \
+            || die "Could not checkout main or master."
+        branch="$(git symbolic-ref --short HEAD)"
+    fi
+
+    log_info "Pulling latest changes from origin/${branch}..."
+    git pull origin "$branch" \
+        || die "Failed to pull from origin/${branch}. Check your connection."
+    log_ok "Up to date with origin/${branch}"
+}
+
+# ─── Ensure the target tag does not already exist ────────────────────────────
+check_tag() {
+    if git tag -l "$GIT_TAG" | grep -q "$GIT_TAG"; then
+        die "Tag '${GIT_TAG}' already exists. Use a different version."
+    fi
+}
+
+# ─── Extract the newest CHANGELOG section (for GitHub Release notes) ──────────
+# Prints everything from the first "## [" heading up to — but not including —
+# the next one, dropping the heading line itself (GitHub shows the tag as title).
+extract_release_notes() {
+    awk '
+        /^## \[/ { seen++; if (seen == 2) exit; next }
+        seen == 1 { print }
+    ' "$1"
+}
+
+# ─── Success banner ──────────────────────────────────────────────────────────
+print_success_banner() {
+    local tag="$1"
+    # Inner text — no emoji here so width calculation is always accurate
+    local inner="  Release ${tag} published!  "
+    local width=${#inner}
+    # Build the horizontal border dynamically
+    local border
+    printf -v border '%*s' "$width" ''
+    border="${border// /═}"
+
+    echo ""
+    echo -e "${GREEN}  ╔${border}╗"
+    echo -e "  ║${inner}║"
+    echo -e "  ╚${border}╝${NC}"
+    echo ""
+    [[ -n "${PROJECT_URL:-}" ]] && echo -e "  🎉  ${PROJECT_URL}/releases/tag/${tag}"
+    echo ""
+}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+DRY_RUN=false
+INIT_MODE=false
+VERSION=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)     DRY_RUN=true;  shift ;;
+        --init)        INIT_MODE=true; shift ;;
+        --version|-v)  echo "tagsmith $(get_version)"; exit 0 ;;
+        --help|-h)     usage ;;
+        -*)            die "Unknown option: $1" ;;
+        *)
+            [[ -z "$VERSION" ]] && VERSION="$1" || die "Unexpected argument: $1"
+            shift ;;
+    esac
+done
+
+if [[ -z "$VERSION" ]]; then
+    die "Missing version. Usage: tagsmith <version> [--dry-run | --init]"
+fi
+
+# Strip optional leading v/V, validate semver, then derive the git tag.
+#
+#   VERSION  → bare semver used in the changelog  (e.g.  1.2.3-rc.1)
+#   GIT_TAG  → git tag with mandatory v prefix    (e.g. v1.2.3-rc.1)
+GIT_TAG="$VERSION"
+VERSION="${VERSION#[vV]}"
+validate_semver "$VERSION"
+[[ "$GIT_TAG" == v* ]] || GIT_TAG="v${VERSION}"
+
+TOOL_VERSION="$(get_version)"
+# Build a banner that auto-sizes to the version string (which may be long
+# when running between tags, e.g. v0.1.4-3-g4f2abe0-dirty).
+banner_inner="       tagsmith ${TOOL_VERSION}       "
+banner_width=${#banner_inner}
+printf -v banner_border '%*s' "$banner_width" ''
+banner_border="${banner_border// /═}"
+echo -e "${CYAN}"
+echo "  ╔${banner_border}╗"
+echo "  ║${banner_inner}║"
+echo "  ╚${banner_border}╝"
+echo -e "${NC}"
+
+# ─── Preflight ────────────────────────────────────────────────────────────────
+log_step "Running preflight checks"
+preflight
+log_ok "git-cliff & gh available"
+
+# ─── Detect project + GitHub auth ────────────────────────────────────────────
+if detect_project_url; then
+    log_ok "Project: ${PROJECT_URL}"
+    [[ "${IS_GITHUB:-false}" == "true" ]] \
+        || log_warn "Remote 'origin' is not on github.com — GitHub Release/contributors are unavailable."
+else
+    log_warn "Could not detect project URL — issue/PR links will not be generated."
+fi
+
+resolve_github_token
+
+# Online mode requires a GitHub remote AND a token (git-cliff hits the GitHub
+# API to resolve commit authors to @usernames and list contributors).
+ONLINE=false
+if [[ "${IS_GITHUB:-false}" == "true" && -n "${GITHUB_TOKEN:-}" ]]; then
+    ONLINE=true
+    log_ok "GitHub API mode — contributors resolved to @usernames"
+elif [[ "$DRY_RUN" == "true" || "$INIT_MODE" == "true" ]]; then
+    log_warn "Offline mode — @usernames and contributor sections unavailable (no GitHub token or non-GitHub remote)."
+else
+    die "This release flow targets GitHub. Point 'origin' at a GitHub repo and authenticate with: gh auth login"
+fi
+
+prepare_cliff_config
+
+check_tag
+log_ok "Version : ${VERSION}  →  git tag: ${GIT_TAG}"
+
+# Assemble the git-cliff remote arguments once, reuse everywhere.
+cliff_args=(--config "$EFFECTIVE_CLIFF_CONFIG")
+if [[ "$ONLINE" == "true" ]]; then
+    cliff_args+=(--github-repo "$REPO_SLUG" --github-token "$GITHUB_TOKEN")
+else
+    cliff_args+=(--offline)
+fi
+
+# ─── Init mode ────────────────────────────────────────────────────────────────
+if [[ "$INIT_MODE" == "true" ]]; then
+    log_step "Generating initial CHANGELOG.md (full history as ${VERSION})"
+    git-cliff "${cliff_args[@]}" --tag "${GIT_TAG}" --output CHANGELOG.md
+    log_ok "CHANGELOG.md generated"
+
+    if EDITOR_CMD="$(resolve_editor)"; then
+        echo ""
+        log_info "Opening CHANGELOG.md for review..."
+        $EDITOR_CMD CHANGELOG.md
+        log_ok "Editor closed"
+    else
+        log_warn "No editor found. Review CHANGELOG.md manually."
+    fi
+
+    echo ""
+    log_info "Commit when ready:"
+    echo "  git add CHANGELOG.md"
+    echo "  git commit -m 'chore: add initial CHANGELOG'"
+    exit 0
+fi
+
+# ─── Dry run ──────────────────────────────────────────────────────────────────
+if [[ "$DRY_RUN" == "true" ]]; then
+    log_step "Changelog preview for ${VERSION}"
+    echo ""
+    git-cliff "${cliff_args[@]}" --unreleased --tag "${GIT_TAG}"
+    echo ""
+    log_info "This is just a preview. Run without --dry-run to release."
+    exit 0
+fi
+
+# ─── Full release ─────────────────────────────────────────────────────────────
+# A real release rewrites history and pulls — require a clean tree now (preview
+# and init are happy to run with work in progress).
+if ! git diff --quiet HEAD 2>/dev/null; then
+    die "You have uncommitted changes. Commit or stash them first."
+fi
+
+# Only sync for a real release — --dry-run / --init never touch your branches.
+log_step "Syncing with remote"
+sync_main
+
+log_step "Generating changelog for ${VERSION}"
+
+if [[ -f CHANGELOG.md ]]; then
+    git-cliff "${cliff_args[@]}" --unreleased --tag "${GIT_TAG}" --prepend CHANGELOG.md
+    log_ok "CHANGELOG.md updated"
+else
+    git-cliff "${cliff_args[@]}" --tag "${GIT_TAG}" --output CHANGELOG.md
+    log_ok "CHANGELOG.md created"
+fi
+
+# ─── Preview in terminal ─────────────────────────────────────────────────────
+echo ""
+echo -e "${YELLOW}── Preview ──────────────────────────────────${NC}"
+head -30 CHANGELOG.md
+echo -e "${YELLOW}─────────────────────────────────────────────${NC}"
+echo ""
+
+log_info "Do you want to review/edit CHANGELOG.md before releasing? [y/N]"
+read -r edit_confirm
+if [[ "$edit_confirm" =~ ^[yY]$ ]]; then
+    if EDITOR_CMD="$(resolve_editor)"; then
+        log_info "Opening CHANGELOG.md — save and close to continue..."
+        $EDITOR_CMD CHANGELOG.md
+        log_ok "Editor closed"
+    else
+        die "No editor found. Set \$EDITOR or install VS Code / vim / nano."
+    fi
+fi
+
+# ─── Confirm and release ─────────────────────────────────────────────────────
+echo ""
+log_info "Commit, tag, push and publish GitHub Release ${GIT_TAG}? [y/N]"
+read -r confirm
+if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+    log_warn "Cancelled. CHANGELOG.md has been modified — review it manually."
+    exit 1
+fi
+
+log_step "Commit + Tag + Push"
+
+git add CHANGELOG.md
+git commit -m "chore(release): prepare ${GIT_TAG}"
+log_ok "Commit created"
+
+git tag -a "${GIT_TAG}" -m "Release ${GIT_TAG}"
+log_ok "Tag ${GIT_TAG} created"
+
+local_branch="$(git symbolic-ref --short HEAD)"
+git push origin "$local_branch"
+git push origin "${GIT_TAG}"
+log_ok "Push complete"
+
+# ─── Publish GitHub Release ──────────────────────────────────────────────────
+log_step "Publishing GitHub Release"
+NOTES_FILE="$(mktemp "${TMPDIR:-/tmp}/tagsmith-notes.XXXXXX.md")"
+extract_release_notes CHANGELOG.md > "$NOTES_FILE"
+
+release_args=(--verify-tag --title "${GIT_TAG}" --notes-file "$NOTES_FILE")
+# A version with a pre-release identifier (e.g. -rc.1, -beta) is not "latest".
+if [[ "$VERSION" == *-* ]]; then
+    release_args+=(--prerelease)
+else
+    release_args+=(--latest)
+fi
+
+if gh release create "${GIT_TAG}" "${release_args[@]}"; then
+    log_ok "GitHub Release published"
+else
+    log_warn "Tag was pushed but the GitHub Release could not be created automatically."
+    log_warn "Retry manually:  gh release create ${GIT_TAG} --title ${GIT_TAG} --notes-file <notes>"
+fi
+
+print_success_banner "$GIT_TAG"
